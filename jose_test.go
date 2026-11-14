@@ -2798,3 +2798,156 @@ func Ecc512Private() *ecdsa.PrivateKey {
 		[]byte{0, 60, 71, 97, 112, 106, 35, 121, 80, 182, 20, 167, 143, 8, 246, 108, 234, 160, 193, 10, 3, 148, 45, 11, 58, 177, 190, 172, 26, 178, 188, 240, 91, 25, 67, 79, 64, 241, 203, 65, 223, 218, 12, 227, 82, 178, 66, 160, 19, 194, 217, 172, 61, 250, 23, 78, 218, 130, 160, 105, 216, 208, 235, 124, 46, 32},
 		[]byte{0, 222, 129, 9, 133, 207, 123, 116, 176, 83, 95, 169, 29, 121, 160, 137, 22, 21, 176, 59, 203, 129, 62, 111, 19, 78, 14, 174, 20, 211, 56, 160, 83, 42, 74, 219, 208, 39, 231, 33, 84, 114, 71, 106, 109, 161, 116, 243, 166, 146, 252, 231, 137, 228, 99, 149, 152, 123, 201, 157, 155, 131, 181, 106, 179, 112})
 }
+
+func (s *TestSuite) TestDecodeJwsRejectsUnknownCritHeader(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey,
+		Header("crit", []string{"b64"}), Header("b64", false))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): unsupported critical header extension: 'b64'")
+}
+
+func (s *TestSuite) TestDecodeJweRejectsUnknownCritHeader(c *C) {
+	//given
+	token, err := Encrypt("payload", DIR, A128GCM, aes128Key,
+		Header("crit", []string{"custom"}), Header("custom", "value"))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, aes128Key)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): unsupported critical header extension: 'custom'")
+}
+
+func (s *TestSuite) TestDecodeRejectsEmptyCritHeader(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey, Header("crit", []string{}))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): 'crit' header must be a non-empty array of strings")
+}
+
+func (s *TestSuite) TestDecodeRejectsNonArrayCritHeader(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey, Header("crit", "b64"))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): 'crit' header must be a non-empty array of strings")
+}
+
+func (s *TestSuite) TestDecodeRejectsDuplicateCritEntries(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey,
+		Header("crit", []string{"b64", "b64"}), Header("b64", false))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): 'crit' header contains duplicate entry: 'b64'")
+}
+
+func (s *TestSuite) TestDecodeRejectsCritListingRegisteredHeader(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey, Header("crit", []string{"alg"}))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): 'crit' header must not list registered header parameter: 'alg'")
+}
+
+func (s *TestSuite) TestDecodeRejectsCritListingMissingHeader(c *C) {
+	//given
+	token, err := Sign("payload", HS256, shaKey, Header("crit", []string{"b64"}))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "jwt.Decode(): 'crit' header lists 'b64' which is not present in protected header")
+}
+
+func (s *TestSuite) TestDecodeJwsAcceptsRegisteredCritHeader(c *C) {
+	//given
+	RegisterCritHeader("b64", nil)
+	defer DeregisterCritHeader("b64")
+
+	token, err := Sign("payload", HS256, shaKey,
+		Header("crit", []string{"b64"}), Header("b64", false))
+	c.Assert(err, IsNil)
+
+	//when
+	payload, headers, err := Decode(token, shaKey)
+
+	//then
+	c.Assert(err, IsNil)
+	c.Assert(payload, Equals, "payload")
+	c.Assert(headers["b64"], Equals, false)
+}
+
+func (s *TestSuite) TestDecodeJweAcceptsRegisteredCritHeader(c *C) {
+	//given
+	RegisterCritHeader("custom", func(headers map[string]interface{}) error {
+		if headers["custom"] != "value" {
+			return errors.New("unexpected 'custom' value")
+		}
+		return nil
+	})
+	defer DeregisterCritHeader("custom")
+
+	token, err := Encrypt("payload", DIR, A128GCM, aes128Key,
+		Header("crit", []string{"custom"}), Header("custom", "value"))
+	c.Assert(err, IsNil)
+
+	//when
+	payload, _, err := Decode(token, aes128Key)
+
+	//then
+	c.Assert(err, IsNil)
+	c.Assert(payload, Equals, "payload")
+}
+
+func (s *TestSuite) TestDecodeRejectsCritWhenHandlerFails(c *C) {
+	//given
+	RegisterCritHeader("custom", func(headers map[string]interface{}) error {
+		return errors.New("custom extension rejected")
+	})
+	defer DeregisterCritHeader("custom")
+
+	token, err := Sign("payload", HS256, shaKey,
+		Header("crit", []string{"custom"}), Header("custom", "value"))
+	c.Assert(err, IsNil)
+
+	//when
+	_, _, err = Decode(token, shaKey)
+
+	//then
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Equals, "custom extension rejected")
+}

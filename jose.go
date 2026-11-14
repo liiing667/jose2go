@@ -60,6 +60,35 @@ var jwsHashers = map[string]JwsAlgorithm{}
 var jweEncryptors = map[string]JweEncryption{}
 var jwaAlgorithms = map[string]JwaAlgorithm{}
 var jwcCompressors = map[string]JwcAlgorithm{}
+var critExtensions = map[string]CritHandler{}
+
+// registered (standard) JOSE header parameter names, RFC 7515 & RFC 7516.
+// 'crit' is not allowed to list any of those, extensions only.
+var registeredHeaders = map[string]bool{
+	"alg": true, "jku": true, "jwk": true, "kid": true,
+	"x5u": true, "x5c": true, "x5t": true, "x5t#S256": true,
+	"typ": true, "cty": true, "crit": true,
+	"enc": true, "zip": true,
+	"epk": true, "apu": true, "apv": true,
+	"iv": true, "tag": true, "p2s": true, "p2c": true,
+}
+
+// CritHandler is a contract for processing critical header extensions listed
+// in 'crit' header. It is called with decoded JOSE headers and expected to
+// return not nil error if extension value is not acceptable.
+type CritHandler func(headers map[string]interface{}) error
+
+// RegisterCritHeader registers critical header extension, so tokens carrying
+// it in 'crit' header are accepted by Decode. handler can be nil, in which
+// case only presence of the extension is validated.
+func RegisterCritHeader(name string, handler CritHandler) {
+	critExtensions[name] = handler
+}
+
+// DeregisterCritHeader removes previously registered critical header extension
+func DeregisterCritHeader(name string) {
+	delete(critExtensions, name)
+}
 
 // RegisterJwe register new encryption algorithm
 func RegisterJwe(alg JweEncryption) {
@@ -367,6 +396,10 @@ func verify(parts [][]byte, key interface{}) (plainText []byte, headers map[stri
 		return nil, nil, err
 	}
 
+	if err = validateCrit(jwtHeader); err != nil {
+		return nil, nil, err
+	}
+
 	if alg, ok := jwtHeader["alg"].(string); ok {
 		if verifier, ok := jwsHashers[alg]; ok {
 			if key, err = retrieveActualKey(jwtHeader, string(payload), key); err != nil {
@@ -394,6 +427,10 @@ func decrypt(parts [][]byte, key interface{}) (plainText []byte, headers map[str
 
 	if e := json.Unmarshal(header, &jwtHeader); e != nil {
 		return nil, nil, e
+	}
+
+	if err = validateCrit(jwtHeader); err != nil {
+		return nil, nil, err
 	}
 
 	var keyMgmtAlg JwaAlgorithm
@@ -447,6 +484,65 @@ func decrypt(parts [][]byte, key interface{}) (plainText []byte, headers map[str
 	}
 
 	return nil, nil, errors.New(fmt.Sprintf("jwt.decrypt(): Unknown key management algorithm '%v'", alg))
+}
+
+// validateCrit enforces RFC 7515, Section 4.1.11 rules for 'crit' header:
+// it must be a non-empty array of unique strings, must not list registered
+// header parameter names, every listed extension must be present in the
+// protected header itself and must be explicitly registered via
+// RegisterCritHeader, otherwise token is rejected.
+func validateCrit(jwtHeader map[string]interface{}) error {
+	crit, present := jwtHeader["crit"]
+
+	if !present {
+		return nil
+	}
+
+	list, ok := crit.([]interface{})
+
+	if !ok || len(list) == 0 {
+		return errors.New(fmt.Sprint("jwt.Decode(): 'crit' header must be a non-empty array of strings"))
+	}
+
+	seen := make(map[string]bool, len(list))
+
+	for _, e := range list {
+		name, ok := e.(string)
+
+		if !ok {
+			return errors.New(fmt.Sprint("jwt.Decode(): 'crit' header must be a non-empty array of strings"))
+		}
+
+		if seen[name] {
+			return errors.New(fmt.Sprintf("jwt.Decode(): 'crit' header contains duplicate entry: '%v'", name))
+		}
+
+		seen[name] = true
+	}
+
+	for name := range seen {
+		if registeredHeaders[name] {
+			return errors.New(fmt.Sprintf("jwt.Decode(): 'crit' header must not list registered header parameter: '%v'", name))
+		}
+
+		if _, ok := jwtHeader[name]; !ok {
+			return errors.New(fmt.Sprintf("jwt.Decode(): 'crit' header lists '%v' which is not present in protected header", name))
+		}
+
+		handler, known := critExtensions[name]
+
+		if !known {
+			return errors.New(fmt.Sprintf("jwt.Decode(): unsupported critical header extension: '%v'", name))
+		}
+
+		if handler != nil {
+			if err := handler(jwtHeader); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 func retrieveActualKey(headers map[string]interface{}, payload string, key interface{}) (interface{}, error) {
